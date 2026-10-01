@@ -221,8 +221,11 @@ def pressed(vk, _state={}):
     was = _state.get(vk, False); _state[vk] = down
     return down and not was
 
+# Where settings files live; the packaged GUI exe points this at %APPDATA% instead.
+SETTINGS_DIR = os.path.dirname(os.path.abspath(__file__))
+
 def load_settings(name, defaults):
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    path = os.path.join(SETTINGS_DIR, name)
     try:
         with open(path) as f:
             return {**defaults, **json.load(f)}
@@ -230,7 +233,7 @@ def load_settings(name, defaults):
         return dict(defaults)
 
 def save_settings(name, values):
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    path = os.path.join(SETTINGS_DIR, name)
     try:
         with open(path, "w") as f:
             json.dump(values, f, indent=2)

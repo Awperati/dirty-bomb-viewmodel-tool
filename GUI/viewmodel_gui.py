@@ -11,7 +11,7 @@ while it is running can get you kicked or banned.
 
 Pure standard library (tkinter + ctypes). Needs Windows and Python 3.8+.
 """
-import atexit, ctypes, json, math, os, queue, struct, sys, threading, time
+import atexit, ctypes, ctypes.wintypes as wt, json, math, os, queue, struct, sys, threading, time, winreg
 import tkinter as tk
 from tkinter import font as tkfont, messagebox
 
@@ -21,7 +21,57 @@ import dbmem
 import viewmodel_fov as fovmod
 import viewmodel_position as posmod
 
-CONFIG_FILE = os.path.join(HERE, "gui_config.json")
+FROZEN = getattr(sys, "frozen", False)          # running as the packaged .exe
+RES = getattr(sys, "_MEIPASS", HERE)            # where bundled files (icon) live
+if FROZEN:   # the exe unpacks to a temp folder each run, so keep settings somewhere permanent
+    DATA_DIR = os.path.join(os.environ.get("APPDATA", HERE), "DirtyBombViewmodelTool")
+    os.makedirs(DATA_DIR, exist_ok=True)
+    dbmem.SETTINGS_DIR = DATA_DIR
+else:
+    DATA_DIR = HERE
+CONFIG_FILE = os.path.join(DATA_DIR, "gui_config.json")
+ICON = os.path.join(RES, "assets", "icon.ico")
+CONFIG_DEFAULTS = {"accepted": False, "tray": True}
+
+def load_config():
+    try:
+        with open(CONFIG_FILE) as f:
+            return {**CONFIG_DEFAULTS, **json.load(f)}
+    except (OSError, ValueError):
+        return dict(CONFIG_DEFAULTS)
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError:
+        pass
+
+# "Start with Windows" = a per-user Run key (no admin needed); the entry launches us minimised.
+RUN_KEY, RUN_NAME = r"Software\Microsoft\Windows\CurrentVersion\Run", "DirtyBombViewmodelTool"
+
+def startup_command():
+    if FROZEN:
+        return f'"{sys.executable}" --tray'
+    pw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    return f'"{pw if os.path.exists(pw) else sys.executable}" "{os.path.abspath(__file__)}" --tray'
+
+def startup_enabled():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            return bool(winreg.QueryValueEx(k, RUN_NAME)[0])
+    except OSError:
+        return False
+
+def set_startup(on):
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        if on:
+            winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, startup_command())
+        else:
+            try:
+                winreg.DeleteValue(k, RUN_NAME)
+            except FileNotFoundError:
+                pass
 
 BG, CARD, CARD2, LINE = "#0e1014", "#161a21", "#1f242e", "#2b3140"
 TEXT, MUTED = "#e8eaf0", "#8b93a5"
@@ -175,6 +225,151 @@ class Engine(threading.Thread):
                 except OSError:
                     pass
             self.stop_evt.wait(0.025)
+
+# ------------------------------------------------------------------ tray ---
+
+class Tray(threading.Thread):
+    """Notification-area icon (plain ctypes, no dependencies) with a right-click menu.
+
+    Runs its own message loop; actions are handed to the UI through post(name).
+    """
+    CALLBACK = 0x8001
+    ITEMS = {1: "show", 2: "fov", 3: "pos", 4: "exit"}
+
+    def __init__(self, tip, state_fn, post):
+        super().__init__(daemon=True)
+        self.tip, self.state_fn, self.post = tip, state_fn, post
+        self.hwnd, self.ready, self.error, self.added = None, threading.Event(), None, False
+
+    @property
+    def ok(self):
+        return self.added and self.hwnd is not None
+
+    def set_tip(self, tip):
+        self.tip = tip
+        if self.hwnd:
+            self.nid.szTip = tip[:127]
+            self.sh.Shell_NotifyIconW(1, ctypes.byref(self.nid))        # NIM_MODIFY
+
+    def stop(self):
+        self.ready.wait(2)
+        if self.hwnd:
+            self.u.PostMessageW(self.hwnd, 0x0010, 0, 0)                 # WM_CLOSE
+        self.join(2)
+
+    def run(self):
+        try:
+            self._run()
+        except Exception as e:           # never leave the UI waiting on a tray that failed to start
+            self.error = repr(e)
+        finally:
+            self.hwnd = None
+            self.ready.set()
+
+    def _run(self):
+        u = self.u = ctypes.WinDLL("user32", use_last_error=True)
+        sh = self.sh = ctypes.WinDLL("shell32")
+        k = ctypes.WinDLL("kernel32")
+        H, W, L, LR = wt.HWND, wt.WPARAM, wt.LPARAM, ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LR, H, wt.UINT, W, L)
+
+        class WNDCLASS(ctypes.Structure):
+            _fields_ = [("style", wt.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
+                        ("cbWndExtra", ctypes.c_int), ("hInstance", wt.HINSTANCE), ("hIcon", wt.HICON),
+                        ("hCursor", wt.HANDLE), ("hbrBackground", wt.HBRUSH), ("lpszMenuName", wt.LPCWSTR),
+                        ("lpszClassName", wt.LPCWSTR)]
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("a", wt.DWORD), ("b", wt.WORD), ("c", wt.WORD), ("d", ctypes.c_ubyte * 8)]
+
+        class NID(ctypes.Structure):
+            _fields_ = [("cbSize", wt.DWORD), ("hWnd", H), ("uID", wt.UINT), ("uFlags", wt.UINT),
+                        ("uCallbackMessage", wt.UINT), ("hIcon", wt.HICON), ("szTip", ctypes.c_wchar * 128),
+                        ("dwState", wt.DWORD), ("dwStateMask", wt.DWORD), ("szInfo", ctypes.c_wchar * 256),
+                        ("uVersion", wt.UINT), ("szInfoTitle", ctypes.c_wchar * 64), ("dwInfoFlags", wt.DWORD),
+                        ("guidItem", GUID), ("hBalloonIcon", wt.HICON)]
+
+        u.DefWindowProcW.argtypes = [H, wt.UINT, W, L]; u.DefWindowProcW.restype = LR
+        u.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASS)]; u.RegisterClassW.restype = wt.ATOM
+        u.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, ctypes.c_int, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_int, H, wt.HMENU, wt.HINSTANCE, wt.LPVOID]
+        u.CreateWindowExW.restype = H
+        u.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), H, wt.UINT, wt.UINT]
+        u.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
+        u.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]; u.DispatchMessageW.restype = LR
+        u.PostMessageW.argtypes = [H, wt.UINT, W, L]
+        u.DestroyWindow.argtypes = [H]
+        u.PostQuitMessage.argtypes = [ctypes.c_int]
+        u.CreatePopupMenu.restype = wt.HMENU
+        u.AppendMenuW.argtypes = [wt.HMENU, wt.UINT, ctypes.c_size_t, wt.LPCWSTR]
+        u.TrackPopupMenu.argtypes = [wt.HMENU, wt.UINT, ctypes.c_int, ctypes.c_int, ctypes.c_int, H, ctypes.c_void_p]
+        u.DestroyMenu.argtypes = [wt.HMENU]
+        u.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
+        u.SetForegroundWindow.argtypes = [H]
+        u.GetSystemMetrics.argtypes = [ctypes.c_int]
+        u.LoadImageW.argtypes = [wt.HINSTANCE, wt.LPCWSTR, wt.UINT, ctypes.c_int, ctypes.c_int, wt.UINT]
+        u.LoadImageW.restype = wt.HANDLE
+        u.RegisterWindowMessageW.argtypes = [wt.LPCWSTR]; u.RegisterWindowMessageW.restype = wt.UINT
+        k.GetModuleHandleW.argtypes = [wt.LPCWSTR]; k.GetModuleHandleW.restype = wt.HMODULE
+        sh.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.POINTER(NID)]
+
+        taskbar_created = u.RegisterWindowMessageW("TaskbarCreated")   # explorer restarted: re-add the icon
+        nid = self.nid = NID()
+
+        def add():
+            self.added = bool(sh.Shell_NotifyIconW(0, ctypes.byref(nid)))   # NIM_ADD
+
+        def menu(hwnd):
+            fov_on, pos_on = self.state_fn()
+            m = u.CreatePopupMenu()
+            u.AppendMenuW(m, 0, 1, "Show window")
+            u.AppendMenuW(m, 0x800, 0, None)
+            u.AppendMenuW(m, 0x8 if fov_on else 0, 2, "FOV multiplier")
+            u.AppendMenuW(m, 0x8 if pos_on else 0, 3, "Viewmodel position")
+            u.AppendMenuW(m, 0x800, 0, None)
+            u.AppendMenuW(m, 0, 4, "Exit")
+            pt = wt.POINT(); u.GetCursorPos(ctypes.byref(pt))
+            u.SetForegroundWindow(hwnd)                                  # else the menu never dismisses
+            cmd = u.TrackPopupMenu(m, 0x180, pt.x, pt.y, 0, hwnd, None)  # TPM_RETURNCMD | TPM_RIGHTBUTTON
+            u.PostMessageW(hwnd, 0, 0, 0)
+            u.DestroyMenu(m)
+            if cmd in self.ITEMS:
+                self.post(self.ITEMS[cmd])
+
+        def proc(hwnd, msg, wp, lp):
+            if msg == self.CALLBACK:
+                if lp in (0x202, 0x203):                                 # left click / double click
+                    self.post("show")
+                elif lp == 0x205:                                        # right click
+                    menu(hwnd)
+                return 0
+            if msg == taskbar_created:
+                add(); return 0
+            if msg == 0x0010:                                            # WM_CLOSE
+                u.DestroyWindow(hwnd); return 0
+            if msg == 0x0002:                                            # WM_DESTROY
+                sh.Shell_NotifyIconW(2, ctypes.byref(nid))               # NIM_DELETE
+                u.PostQuitMessage(0); return 0
+            return u.DefWindowProcW(hwnd, msg, wp, lp)
+
+        self._proc = WNDPROC(proc)                                       # keep a reference alive
+        cls = WNDCLASS(); cls.lpfnWndProc = self._proc; cls.hInstance = k.GetModuleHandleW(None)
+        cls.lpszClassName = "DirtyBombViewmodelTray"
+        u.RegisterClassW(ctypes.byref(cls))
+        self.hwnd = u.CreateWindowExW(0, cls.lpszClassName, "tray", 0, 0, 0, 0, 0, -3, None, cls.hInstance, None)  # HWND_MESSAGE
+        small = u.GetSystemMetrics(49)                                   # SM_CXSMICON
+        nid.cbSize = ctypes.sizeof(NID); nid.hWnd = self.hwnd; nid.uID = 1
+        nid.uFlags = 0x7                                                 # NIF_MESSAGE | NIF_ICON | NIF_TIP
+        nid.uCallbackMessage = self.CALLBACK
+        nid.hIcon = u.LoadImageW(None, ICON, 1, small, small, 0x10)      # IMAGE_ICON, LR_LOADFROMFILE
+        nid.szTip = self.tip[:127]
+        add()
+        if not self.added:
+            raise OSError("Shell_NotifyIcon refused the icon")
+        self.ready.set()
+        msg = wt.MSG()
+        while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            u.TranslateMessage(ctypes.byref(msg)); u.DispatchMessageW(ctypes.byref(msg))
 
 # ---------------------------------------------------------------- widgets ---
 
@@ -371,6 +566,7 @@ class App:
         self.events = queue.Queue()
         self.engine = Engine(self.fov_s, self.pos_s, self.events)
         self.state, self.phase, self.save_job = "waiting", 0.0, None
+        self.cfg, self.tray = load_config(), None
 
         root.title("Dirty Bomb Viewmodel Tool")
         root.configure(bg=BG)
@@ -378,15 +574,23 @@ class App:
         root.minsize(px(1000), px(600))
         dark_titlebar(root)
         root.protocol("WM_DELETE_WINDOW", self.close)
+        root.bind("<Unmap>", self.on_unmap)
+        try:
+            root.iconbitmap(ICON)
+        except tk.TclError:
+            pass
         atexit.register(self.engine.stop)
 
         self.build()
         self.set_state("waiting")
         self.changed()
-        if not selftest and not self.accepted():
+        if not selftest and not self.cfg["accepted"]:
             self.consent()
         else:
             self.start_engine()
+        self.apply_tray()
+        if "--tray" in sys.argv and self.cfg["accepted"]:   # launched by "Start with Windows"
+            root.after(1000, lambda: root.withdraw() if self.tray and self.tray.ok else root.iconify())
         self.tick()
         self.poll()
 
@@ -404,6 +608,7 @@ class App:
                  font=F["small"]).pack(side="left", pady=(px(8), 0))
         self.pill = tk.Canvas(head, width=px(250), height=px(30), bg=BG, highlightthickness=0)
         self.pill.pack(side="right")
+        HoldButton(head, "⚙  Settings", self.settings_panel, bg=BG).pack(side="right", padx=(0, px(10)))
 
         self.fov_card = self.card(0, "FOV MULTIPLIER", "Scales the weapon FOV every frame.",
                                   self.fov_s, self.on_fov_toggle)
@@ -479,13 +684,6 @@ class App:
             self.engine.start()
 
     # ---- first-run consent page
-    def accepted(self):
-        try:
-            with open(CONFIG_FILE) as f:
-                return bool(json.load(f).get("accepted"))
-        except (OSError, ValueError):
-            return False
-
     def consent(self):
         ov = tk.Frame(self.root, bg=BG); ov.place(relx=0, rely=0, relwidth=1, relheight=1)
         box = self.frame(ov); box.place(relx=0.5, rely=0.5, anchor="center")
@@ -507,13 +705,67 @@ class App:
                        activeforeground=TEXT, font=F["text"], highlightthickness=0).pack(anchor="w")
         btn.pack(anchor="e", pady=(px(16), 0))
         def go():
-            try:
-                with open(CONFIG_FILE, "w") as f:
-                    json.dump({"accepted": True}, f)
-            except OSError:
-                pass
+            self.cfg["accepted"] = True
+            save_config(self.cfg)
             ov.destroy()
             self.start_engine()
+
+    # ---- settings page
+    def settings_panel(self):
+        ov = tk.Frame(self.root, bg=BG); ov.place(relx=0, rely=0, relwidth=1, relheight=1)
+        box = self.frame(ov); box.place(relx=0.5, rely=0.5, anchor="center")
+        inner = tk.Frame(box, bg=CARD); inner.pack(padx=px(36), pady=px(30))
+        tk.Label(inner, text="Settings", bg=CARD, fg=ACCENT, font=F["title"]).pack(anchor="w", pady=(0, px(8)))
+
+        def option(title, sub, value, command):
+            row = tk.Frame(inner, bg=CARD); row.pack(fill="x", pady=px(9))
+            col = tk.Frame(row, bg=CARD); col.pack(side="left", fill="x", expand=True, padx=(0, px(30)))
+            tk.Label(col, text=title, bg=CARD, fg=TEXT, font=F["h2"]).pack(anchor="w")
+            tk.Label(col, text=sub, bg=CARD, fg=MUTED, font=F["small"], justify="left").pack(anchor="w")
+            Switch(row, value, command).pack(side="right")
+
+        option("Start with Windows", "Launch automatically when you sign in, minimised\nto the tray, ready for Dirty Bomb.",
+               startup_enabled(), self.opt_startup)
+        option("Minimise to system tray", "Minimising hides the window to the notification area.\n"
+               "The tool keeps running; click the tray icon to reopen it.", self.cfg["tray"], self.opt_tray)
+        tk.Label(inner, text=f"Settings folder: {DATA_DIR}", bg=CARD, fg=MUTED, font=F["small"]).pack(anchor="w", pady=(px(10), 0))
+        HoldButton(inner, "Done", ov.destroy).pack(anchor="e", pady=(px(14), 0))
+
+    def opt_startup(self, on):
+        try:
+            set_startup(on)
+        except OSError as e:
+            messagebox.showerror("Start with Windows", f"Could not update the startup entry:\n{e}")
+
+    def opt_tray(self, on):
+        self.cfg["tray"] = on
+        save_config(self.cfg)
+        self.apply_tray()
+
+    # ---- tray
+    def apply_tray(self):
+        if self.cfg["tray"] and not self.tray:
+            self.tray = Tray(self.tip(), lambda: (self.fov_s["enabled"], self.pos_s["enabled"]),
+                             lambda name: self.events.put(("tray", name)))
+            self.tray.start()
+            self.root.after(1500, self.check_tray)
+        elif not self.cfg["tray"] and self.tray:
+            self.tray.stop(); self.tray = None
+            self.show_window()
+
+    def check_tray(self):
+        if self.tray and not self.tray.ok:
+            self.write(f"System tray unavailable ({self.tray.error or 'unknown error'}); minimising uses the taskbar.")
+
+    def tip(self):
+        return "Viewmodel Tool - " + STATES[self.state][0].title()
+
+    def on_unmap(self, e):
+        if e.widget is self.root and self.cfg["tray"] and self.tray and self.tray.ok and self.root.state() == "iconic":
+            self.root.after_idle(self.root.withdraw)
+
+    def show_window(self):
+        self.root.deiconify(); self.root.state("normal"); self.root.lift(); self.root.focus_force()
 
     # ---- callbacks (UI thread)
     def on_fov(self):
@@ -576,6 +828,16 @@ class App:
                     self.write("Position hook: " + ("attached" if pok else f"failed ({perr})"))
                 elif kind == "sync":
                     self.sync()
+                elif kind == "tray":
+                    name = args[0]
+                    if name == "show":
+                        self.show_window()
+                    elif name == "fov":
+                        v = not self.fov_s["enabled"]; self.fov_card.switch.set(v); self.on_fov_toggle(v)
+                    elif name == "pos":
+                        v = not self.pos_s["enabled"]; self.pos_card.switch.set(v); self.on_pos_toggle(v)
+                    elif name == "exit":
+                        self.close(); return
                 elif kind == "log":
                     self.write(args[0])
         except queue.Empty:
@@ -584,6 +846,8 @@ class App:
 
     def set_state(self, name):
         self.state = name
+        if self.tray:
+            self.tray.set_tip(self.tip())
 
     def tick(self):
         text, color, pulse = STATES[self.state]
@@ -605,6 +869,8 @@ class App:
         if self.save_job:
             self.save()
         self.engine.stop()
+        if self.tray:
+            self.tray.stop()
         self.root.destroy()
 
 def claim_instance():

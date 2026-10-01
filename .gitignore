@@ -3,3 +3,6 @@ __pycache__/
 fov_settings.json
 position_settings.json
 GUI/gui_config.json
+GUI/.buildvenv/
+GUI/build/
+GUI/dist/

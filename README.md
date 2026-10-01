@@ -18,7 +18,7 @@ Dirty Bomb ships with EasyAntiCheat. **Use this tool only offline / with EAC dis
 
 ## GUI edition (optional)
 
-Prefer sliders and buttons? The [`GUI`](GUI) folder has a one-window version with live adjustment. Run `GUI/Run GUI.bat`; see [GUI/README.md](GUI/README.md).
+Prefer sliders and buttons? The [`GUI`](GUI) folder has a one-window version with live adjustment. Run `GUI/Run GUI.bat`, or build a single exe with `GUI/build_exe.bat`. It can sit in the system tray and start with Windows. See [GUI/README.md](GUI/README.md).
 
 ## Running
 

@@ -16,6 +16,10 @@ Dirty Bomb ships with EasyAntiCheat. **Use this tool only offline / with EAC dis
 - Windows (64-bit Dirty Bomb, `shootergame-win32-shipping.exe`)
 - Python 3.8+ (standard library only, no pip installs)
 
+## GUI edition (optional)
+
+Prefer sliders and buttons? The [`GUI`](GUI) folder has a one-window version with live adjustment. Run `GUI/Run GUI.bat`; see [GUI/README.md](GUI/README.md).
+
 ## Running
 
 Start the game first or afterwards (the tools wait for it), then double-click:

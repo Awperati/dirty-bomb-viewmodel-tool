@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 fov_settings.json
 position_settings.json
+GUI/gui_config.json
